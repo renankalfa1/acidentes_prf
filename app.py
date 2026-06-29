@@ -1,21 +1,11 @@
 """
 Rotas & Acidentes — Streamlit App
 ==================================
-O arquivo .parquet fica armazenado no servidor (pasta `data/`).
-Qualquer visitante pode consultar rotas sem precisar fazer upload ou
-configurar nada. O administrador coloca o arquivo lá uma única vez.
-
-Estrutura esperada do parquet
-------------------------------
-Obrigatórias : latitude (float), longitude (float)
-Opcional     : qualquer coluna com "tipo", "type", "acidente" ou "accident"
-               qualquer coluna com "data", "date"
-               qualquer coluna com "morto", "dead", "obito"
-               qualquer coluna com "ferido", "injured", "wound"
 """
 
 import streamlit as st
 import folium
+from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 import requests
 import duckdb
@@ -40,15 +30,25 @@ NOMINATIM    = "https://nominatim.openstreetmap.org/search"
 DATA_DIR     = Path("data/processed")
 PARQUET_FILE = DATA_DIR / "acidentes.parquet"   # ← arquivo do servidor
 
+# Paleta para os 17 tipos oficiais — hex direto, sem intermediário Leaflet
 ACCIDENT_COLORS = {
-    "Colisão":        "red",
-    "Atropelamento":  "orange",
-    "Capotamento":    "purple",
-    "Queda":          "blue",
-    "Incêndio":       "darkred",
-    "Saída de Pista": "cadetblue",
-    "Engavetamento":  "darkblue",
-    "Outros":         "gray",
+    "Tombamento":                        "#e67e22",  # laranja
+    "Colisão frontal":                   "#c0392b",  # vermelho escuro
+    "Colisão traseira":                  "#e74c3c",  # vermelho
+    "Saída de leito carroçável":         "#16a085",  # verde-teal
+    "Incêndio":                          "#d35400",  # laranja queimado
+    "Colisão com objeto":                "#8e44ad",  # roxo
+    "Colisão lateral mesmo sentido":     "#f39c12",  # amarelo-âmbar
+    "Colisão lateral sentido oposto":    "#e91e63",  # rosa
+    "Queda de ocupante de veículo":      "#2980b9",  # azul médio
+    "Engavetamento":                     "#1a5276",  # azul marinho
+    "Derramamento de carga":             "#795548",  # marrom
+    "Colisão transversal":               "#ff5722",  # laranja avermelhado
+    "Atropelamento de Pedestre":         "#27ae60",  # verde
+    "Capotamento":                       "#6c3483",  # violeta
+    "Atropelamento de Animal":           "#117a65",  # verde escuro
+    "Eventos atípicos":                  "#7f8c8d",  # cinza
+    "Sinistro pessoal de trânsito":      "#566573",  # cinza escuro
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,25 +154,112 @@ def get_route(origin_ll: tuple, dest_ll: tuple):
     return coords, bbox
 
 
-def query_accidents(bbox: tuple, margin_km: float) -> pd.DataFrame:
-    con, col_map, _ = _load_parquet_to_duckdb()
+# ─────────────────────────────────────────────────────────────────────────────
+# Geometria — simplificação de rota e distância ponto→segmento
+# ─────────────────────────────────────────────────────────────────────────────
 
+_R_EARTH = 6_371_000.0  # raio médio da Terra em metros
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distância em metros entre dois pontos (graus decimais)."""
+    rl1, rlo1, rl2, rlo2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = rl2 - rl1
+    dlon = rlo2 - rlo1
+    a = np.sin(dlat / 2) ** 2 + np.cos(rl1) * np.cos(rl2) * np.sin(dlon / 2) ** 2
+    return 2 * _R_EARTH * np.arcsin(np.sqrt(a))
+
+
+def _simplify_route(coords: list[list[float]], max_points: int = 300) -> np.ndarray:
+    """
+    Reduz a polilinha a no máximo max_points por subamostragem uniforme.
+    Preserva sempre o primeiro e o último ponto.
+    Retorna array (N, 2) com [lat, lon].
+    """
+    arr = np.array(coords, dtype=np.float64)   # (N, 2)
+    if len(arr) <= max_points:
+        return arr
+    idx = np.round(np.linspace(0, len(arr) - 1, max_points)).astype(int)
+    return arr[idx]
+
+
+def _min_dist_to_polyline_m(
+    pts_lat: np.ndarray,
+    pts_lon: np.ndarray,
+    route: np.ndarray,
+) -> np.ndarray:
+    """
+    Calcula, para cada ponto (pts_lat[i], pts_lon[i]), a distância mínima
+    em metros até qualquer segmento da polilinha `route` (array Nx2 [lat,lon]).
+
+    Usa projeção no plano local (equiretangular) — válida para distâncias
+    de até ~50 km, mais que suficiente para o buffer de 1–5 km.
+
+    Retorna array 1-D com a distância mínima de cada ponto.
+    """
+    # Segmentos: A → B
+    A = route[:-1]   # (M, 2)
+    B = route[1:]    # (M, 2)
+
+    # Converte lat/lon para metros no plano local centrado na rota
+    lat0 = route[:, 0].mean()
+    cos_lat = np.cos(np.radians(lat0))
+    DEG_LAT = _R_EARTH * np.pi / 180.0
+    DEG_LON = DEG_LAT * cos_lat
+
+    # Coordenadas dos segmentos em metros
+    ax = A[:, 1] * DEG_LON;  ay = A[:, 0] * DEG_LAT   # (M,)
+    bx = B[:, 1] * DEG_LON;  by = B[:, 0] * DEG_LAT   # (M,)
+    dx = bx - ax;             dy = by - ay              # (M,)
+    seg_len2 = dx * dx + dy * dy                        # (M,) comprimento² de cada segmento
+
+    # Coordenadas dos pontos candidatos em metros
+    px = (pts_lon * DEG_LON)[:, None]   # (P, 1)
+    py = (pts_lat * DEG_LAT)[:, None]   # (P, 1)
+
+    # Parâmetro t ∈ [0,1] da projeção de cada ponto sobre cada segmento
+    # t = ((P-A)·(B-A)) / |B-A|²
+    t = ((px - ax) * dx + (py - ay) * dy) / np.where(seg_len2 > 0, seg_len2, 1.0)
+    t = np.clip(t, 0.0, 1.0)           # (P, M)
+
+    # Ponto mais próximo sobre o segmento
+    cx = ax + t * dx    # (P, M)
+    cy = ay + t * dy    # (P, M)
+
+    # Distância euclidiana no plano local
+    dist2 = (px - cx) ** 2 + (py - cy) ** 2   # (P, M)
+    return np.sqrt(dist2.min(axis=1))          # (P,)
+
+
+def query_accidents(route_coords: list, buffer_km: float) -> pd.DataFrame:
+    """
+    Filtragem em 2 estágios:
+
+    1. Pré-filtro rápido no DuckDB com bbox ligeiramente expandida
+       (descarta a grande maioria dos registros sem custo de memória).
+
+    2. Filtro preciso em NumPy: distância ponto → segmento mais próximo
+       da rota ≤ buffer_km. Funciona corretamente para rotas longas
+       e curvas (ex.: SP→RJ), sem o falso-positivo do retângulo.
+    """
+    con, col_map, _ = _load_parquet_to_duckdb()
     if not col_map["lat"] or not col_map["lon"]:
         return pd.DataFrame()
 
-    margin     = margin_km / 111.0
-    min_lat    = bbox[0] - margin
-    max_lat    = bbox[1] + margin
-    min_lon    = bbox[2] - margin
-    max_lon    = bbox[3] + margin
+    # ── Estágio 1: pré-filtro bbox no DuckDB ──────────────────────────────────
+    arr = np.array(route_coords)
+    pad = (buffer_km + 1.0) / 111.0          # +1 km de margem de segurança
+    min_lat = arr[:, 0].min() - pad
+    max_lat = arr[:, 0].max() + pad
+    min_lon = arr[:, 1].min() - pad
+    max_lon = arr[:, 1].max() + pad
 
-    lat  = col_map["lat"]
-    lon  = col_map["lon"]
-    tipo = col_map["tipo"]
+    lat_col  = col_map["lat"]
+    lon_col  = col_map["lon"]
+    tipo_col = col_map["tipo"]
 
-    selects = [f'"{lat}" AS latitude', f'"{lon}" AS longitude']
-    selects.append(f'"{tipo}" AS tipo_acidente' if tipo else "'Outros' AS tipo_acidente")
-
+    selects = [f'"{lat_col}" AS latitude', f'"{lon_col}" AS longitude']
+    selects.append(f'"{tipo_col}" AS tipo_acidente' if tipo_col else "'Outros' AS tipo_acidente")
     for alias, key in [("data_acidente", "data"), ("mortos", "mortos"), ("feridos", "feridos")]:
         if col_map.get(key):
             selects.append(f'"{col_map[key]}" AS {alias}')
@@ -180,23 +267,80 @@ def query_accidents(bbox: tuple, margin_km: float) -> pd.DataFrame:
     sql = f"""
         SELECT {', '.join(selects)}
         FROM acidentes
-        WHERE "{lat}" BETWEEN {min_lat} AND {max_lat}
-          AND "{lon}" BETWEEN {min_lon} AND {max_lon}
+        WHERE "{lat_col}" BETWEEN {min_lat} AND {max_lat}
+          AND "{lon_col}" BETWEEN {min_lon} AND {max_lon}
     """
-    return con.execute(sql).df()
+    candidates = con.execute(sql).df()
+
+    if candidates.empty:
+        return candidates
+
+    # ── Estágio 2: filtro preciso por distância ao segmento mais próximo ──────
+    route_simplified = _simplify_route(route_coords, max_points=300)
+
+    dists = _min_dist_to_polyline_m(
+        candidates["latitude"].to_numpy(),
+        candidates["longitude"].to_numpy(),
+        route_simplified,
+    )
+    candidates["dist_rota_m"] = dists.round(0).astype(int)
+    mask = dists <= buffer_km * 1_000.0
+    return candidates[mask].reset_index(drop=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mapa
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _cluster_icon_js(color: str) -> str:
+    """
+    Retorna o JavaScript que customiza a aparência do cluster bubble
+    para uma determinada cor. Usado no parâmetro icon_create_function
+    do MarkerCluster.
+    """
+    return f"""
+    function(cluster) {{
+        var count = cluster.getChildCount();
+        var size  = count < 10 ? 32 : count < 50 ? 40 : 48;
+        return L.divIcon({{
+            html: '<div style="'
+                + 'background:{color};'
+                + 'border:2px solid white;'
+                + 'border-radius:50%;'
+                + 'width:' + size + 'px;'
+                + 'height:' + size + 'px;'
+                + 'display:flex;'
+                + 'align-items:center;'
+                + 'justify-content:center;'
+                + 'color:white;'
+                + 'font-weight:bold;'
+                + 'font-size:12px;'
+                + 'box-shadow:0 1px 4px rgba(0,0,0,.4);'
+                + '">' + count + '</div>',
+            className: '',
+            iconSize: [size, size],
+        }});
+    }}
+    """
+
+
 def build_map(route_coords: list, accidents_df: pd.DataFrame) -> folium.Map:
+    """
+    Constrói o mapa Folium com:
+      • Rota em azul
+      • Marcadores de origem / destino
+      • Um MarkerCluster por tipo de acidente dentro de um FeatureGroup
+        (agrupamento automático ao dar zoom out; expande ao dar zoom in)
+    """
     mid = len(route_coords) // 2
     m = folium.Map(location=route_coords[mid], zoom_start=12, tiles="CartoDB positron")
 
-    # Rota
-    folium.PolyLine(route_coords, color="#2563EB", weight=5,
-                    opacity=0.85, tooltip="Rota calculada").add_to(m)
+    # ── Rota ──────────────────────────────────────────────────────────────────
+    folium.PolyLine(
+        route_coords, color="#2563EB", weight=5,
+        opacity=0.85, tooltip="Rota calculada",
+    ).add_to(m)
+
     folium.Marker(
         route_coords[0], tooltip="Origem",
         icon=folium.Icon(color="green", icon="play", prefix="fa"),
@@ -206,37 +350,72 @@ def build_map(route_coords: list, accidents_df: pd.DataFrame) -> folium.Map:
         icon=folium.Icon(color="red", icon="flag", prefix="fa"),
     ).add_to(m)
 
-    # Acidentes
-    if not accidents_df.empty:
-        grupos: dict[str, folium.FeatureGroup] = {}
-        for tipo in sorted(accidents_df["tipo_acidente"].dropna().unique()):
-            label = str(tipo)
-            grupos[label] = folium.FeatureGroup(name=f"● {label}", show=True)
+    # ── Acidentes agrupados por tipo ──────────────────────────────────────────
+    if accidents_df.empty:
+        return m
 
-        for _, row in accidents_df.iterrows():
-            tipo  = str(row.get("tipo_acidente", "Outros"))
-            color = ACCIDENT_COLORS.get(tipo, "gray")
+    tipos = sorted(accidents_df["tipo_acidente"].dropna().unique())
 
-            html = f"<b>{tipo}</b><br>Lat {row['latitude']:.5f} | Lon {row['longitude']:.5f}"
+    for tipo in tipos:
+        tipo_str  = str(tipo)
+        hex_color = ACCIDENT_COLORS.get(tipo_str, "#7f8c8d")
+
+        # FeatureGroup → aparece como camada ligável/desligável na legenda
+        fg = folium.FeatureGroup(name=f"● {tipo_str}", show=True)
+
+        # MarkerCluster dentro do FeatureGroup com bubble colorida
+        cluster = MarkerCluster(
+            name=tipo_str,
+            icon_create_function=_cluster_icon_js(hex_color),
+            options={
+                "maxClusterRadius": 60,       # raio (px) para agrupar
+                "disableClusteringAtZoom": 16, # expande totalmente a partir deste zoom
+                "spiderfyOnMaxZoom": True,
+            },
+        )
+
+        subset = accidents_df[accidents_df["tipo_acidente"].astype(str) == tipo_str]
+
+        for _, row in subset.iterrows():
+            popup_html = (
+                f"<b style='color:{hex_color}'>{tipo_str}</b><br>"
+                f"<small>Lat {row['latitude']:.5f} | Lon {row['longitude']:.5f}</small>"
+            )
+            if "dist_rota_m" in row:
+                popup_html += f"<br>📏 Dist. rota: {int(row['dist_rota_m'])} m"
             if "data_acidente" in row and pd.notna(row["data_acidente"]):
-                html += f"<br>Data: {str(row['data_acidente'])[:10]}"
-            if "mortos"  in row and pd.notna(row["mortos"]):
-                html += f"<br>Mortos: {int(row['mortos'])}"
+                popup_html += f"<br>📅 {str(row['data_acidente'])[:10]}"
+            if "mortos" in row and pd.notna(row["mortos"]):
+                popup_html += f"<br>💀 Mortos: {int(row['mortos'])}"
             if "feridos" in row and pd.notna(row["feridos"]):
-                html += f"<br>Feridos: {int(row['feridos'])}"
+                popup_html += f"<br>🤕 Feridos: {int(row['feridos'])}"
 
-            folium.CircleMarker(
+            # Ícone individual: círculo colorido via DivIcon
+            div_icon = folium.DivIcon(
+                html=(
+                    f"<div style='"
+                    f"width:12px;height:12px;"
+                    f"border-radius:50%;"
+                    f"background:{hex_color};"
+                    f"border:1.5px solid white;"
+                    f"box-shadow:0 1px 3px rgba(0,0,0,.35);"
+                    f"'></div>"
+                ),
+                icon_size=(12, 12),
+                icon_anchor=(6, 6),
+            )
+
+            folium.Marker(
                 location=[row["latitude"], row["longitude"]],
-                radius=6, color=color, fill=True,
-                fill_color=color, fill_opacity=0.75,
-                popup=folium.Popup(html, max_width=230),
-                tooltip=tipo,
-            ).add_to(grupos.setdefault(tipo, folium.FeatureGroup(name=f"● {tipo}", show=True)))
+                icon=div_icon,
+                popup=folium.Popup(popup_html, max_width=230),
+                tooltip=tipo_str,
+            ).add_to(cluster)
 
-        for fg in grupos.values():
-            fg.add_to(m)
-        folium.LayerControl(collapsed=False).add_to(m)
+        cluster.add_to(fg)
+        fg.add_to(m)
 
+    folium.LayerControl(collapsed=False).add_to(m)
     return m
 
 
@@ -267,15 +446,15 @@ with st.sidebar:
         if tipos_disponiveis:
             st.caption("Tipos de acidente presentes:")
             for t in tipos_disponiveis:
-                cor = ACCIDENT_COLORS.get(str(t), "gray")
-                st.markdown(f"<span style='color:{cor}'>●</span> {t}", unsafe_allow_html=True)
+                hex_cor = ACCIDENT_COLORS.get(str(t), "#7f8c8d")
+                st.markdown(f"<span style='color:{hex_cor}'>●</span> {t}", unsafe_allow_html=True)
     else:
         st.error(f"Erro ao carregar dados:\n{_load_error}")
 
     st.markdown("---")
-    margin_km = st.slider(
-        "Margem do Bounding Box (km)", min_value=1, max_value=5, value=2,
-        help="Expande a busca de acidentes em torno da rota calculada.",
+    buffer_km = st.slider(
+        "Raio do buffer da rota (km)", min_value=1, max_value=20, value=1,
+        help="Filtra apenas acidentes dentro deste raio em relação à linha da rota.",
     )
 
     st.markdown("---")
@@ -329,14 +508,14 @@ if calcular:
         st.rerun()
 
     with st.spinner("Calculando rota..."):
-        route_coords, bbox = get_route(origin_ll, dest_ll)
+        route_coords, _ = get_route(origin_ll, dest_ll)
 
     if route_coords is None:
         st.session_state.error_msg = "Não foi possível traçar a rota. Verifique os endereços."
         st.rerun()
 
     with st.spinner("Consultando acidentes na rota..."):
-        accidents_df = query_accidents(bbox, margin_km)
+        accidents_df = query_accidents(route_coords, buffer_km)
 
     st.session_state.route_coords = route_coords
     st.session_state.accidents_df = accidents_df
@@ -356,7 +535,7 @@ if st.session_state.has_result:
     st.markdown("---")
     m1, m2, m3 = st.columns(3)
     m1.metric("📍 Pontos calculados na rota", f"{len(route_coords):,}")
-    m2.metric("⚠️ Acidentes na região", f"{total_acc:,}")
+    m2.metric("⚠️ Acidentes no buffer", f"{total_acc:,}")
     if total_acc > 0 and "tipo_acidente" in accidents_df.columns:
         top = accidents_df["tipo_acidente"].value_counts().idxmax()
         m3.metric("🔝 Tipo mais frequente", top)
@@ -364,7 +543,7 @@ if st.session_state.has_result:
     # Mapa
     st.markdown("### 🗺️ Mapa")
     mapa = build_map(route_coords, accidents_df)
-    st_folium(mapa, use_container_width=True, height=600)
+    st_folium(mapa, use_container_width=True, height=600, returned_objects=[])
 
     # Tabela e gráfico
     if total_acc > 0:
@@ -381,4 +560,4 @@ if st.session_state.has_result:
 elif not st.session_state.error_msg:
     st.info("👆 Preencha os campos acima e clique em **Calcular Rota** para começar.")
     m = folium.Map(location=[-15.78, -47.93], zoom_start=4, tiles="CartoDB positron")
-    st_folium(m, use_container_width=True, height=500)
+    st_folium(m, use_container_width=True, height=500, returned_objects=[])
