@@ -1,6 +1,17 @@
 """
 Rotas & Acidentes — Streamlit App
 ==================================
+O arquivo .parquet fica armazenado no servidor (pasta `data/`).
+Qualquer visitante pode consultar rotas sem precisar fazer upload ou
+configurar nada. O administrador coloca o arquivo lá uma única vez.
+
+Estrutura esperada do parquet
+------------------------------
+Obrigatórias : latitude (float), longitude (float)
+               categoria_acidente (str) — uma das 4 categorias oficiais
+Opcional     : qualquer coluna com "data", "date"
+               qualquer coluna com "morto", "dead", "obito"
+               qualquer coluna com "ferido", "injured", "wound"
 """
 
 import streamlit as st
@@ -30,26 +41,15 @@ NOMINATIM    = "https://nominatim.openstreetmap.org/search"
 DATA_DIR     = Path("data/processed")
 PARQUET_FILE = DATA_DIR / "acidentes.parquet"   # ← arquivo do servidor
 
-# Paleta para os 17 tipos oficiais — hex direto, sem intermediário Leaflet
+# Paleta das 4 categorias oficiais
 ACCIDENT_COLORS = {
-    "Tombamento":                        "#e67e22",  # laranja
-    "Colisão frontal":                   "#c0392b",  # vermelho escuro
-    "Colisão traseira":                  "#e74c3c",  # vermelho
-    "Saída de leito carroçável":         "#16a085",  # verde-teal
-    "Incêndio":                          "#d35400",  # laranja queimado
-    "Colisão com objeto":                "#8e44ad",  # roxo
-    "Colisão lateral mesmo sentido":     "#f39c12",  # amarelo-âmbar
-    "Colisão lateral sentido oposto":    "#e91e63",  # rosa
-    "Queda de ocupante de veículo":      "#2980b9",  # azul médio
-    "Engavetamento":                     "#1a5276",  # azul marinho
-    "Derramamento de carga":             "#795548",  # marrom
-    "Colisão transversal":               "#ff5722",  # laranja avermelhado
-    "Atropelamento de Pedestre":         "#27ae60",  # verde
-    "Capotamento":                       "#6c3483",  # violeta
-    "Atropelamento de Animal":           "#117a65",  # verde escuro
-    "Eventos atípicos":                  "#7f8c8d",  # cinza
-    "Sinistro pessoal de trânsito":      "#566573",  # cinza escuro
+    "Colisões entre Veículos":                              "#e74c3c",  # vermelho
+    "Acidentes por Perda de Controle":                      "#e67e22",  # laranja
+    "Ocorrências com a Carga, Veículo ou Atípicas":         "#8e44ad",  # roxo
+    "Atropelamentos e Usuários Vulneráveis":                "#27ae60",  # verde
 }
+# Cor de fallback para categorias não mapeadas
+_COLOR_DEFAULT = "#7f8c8d"  # cinza
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session state — inicializa uma única vez por sessão de usuário
@@ -74,14 +74,14 @@ def _create_sample_parquet() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     np.random.seed(42)
     n = 500
-    tipos = list(ACCIDENT_COLORS.keys())
+    categorias = list(ACCIDENT_COLORS.keys())
     df = pd.DataFrame({
-        "latitude":      np.random.uniform(-23.70, -23.40, n),
-        "longitude":     np.random.uniform(-46.85, -46.35, n),
-        "tipo_acidente": np.random.choice(tipos, n),
-        "data":          pd.date_range("2020-01-01", periods=n, freq="D"),
-        "mortos":        np.random.randint(0, 5, n),
-        "feridos":       np.random.randint(0, 20, n),
+        "latitude":           np.random.uniform(-23.70, -23.40, n),
+        "longitude":          np.random.uniform(-46.85, -46.35, n),
+        "categoria_acidente": np.random.choice(categorias, n),
+        "data":               pd.date_range("2020-01-01", periods=n, freq="D"),
+        "mortos":             np.random.randint(0, 5, n),
+        "feridos":            np.random.randint(0, 20, n),
     })
     df.to_parquet(PARQUET_FILE, index=False)
 
@@ -103,16 +103,12 @@ def _load_parquet_to_duckdb() -> tuple[duckdb.DuckDBPyConnection, dict]:
     cols   = {c.lower(): c for c in schema["column_name"].tolist()}
 
     col_map = {}
-    col_map["lat"]  = next((orig for lo, orig in cols.items() if "lat"  in lo), None)
-    col_map["lon"]  = next((orig for lo, orig in cols.items() if "lon"  in lo or "lng" in lo), None)
-    col_map["tipo"] = next(
-        (orig for lo, orig in cols.items()
-         if "tipo" in lo or "type" in lo or "acidente" in lo or "accident" in lo),
-        None,
-    )
-    col_map["data"]   = next((orig for lo, orig in cols.items() if "data" in lo or "date" in lo), None)
-    col_map["mortos"] = next((orig for lo, orig in cols.items() if "morto" in lo or "dead" in lo or "obito" in lo), None)
-    col_map["feridos"]= next((orig for lo, orig in cols.items() if "ferido" in lo or "injur" in lo or "wound" in lo), None)
+    col_map["lat"]      = next((orig for lo, orig in cols.items() if "lat" in lo), None)
+    col_map["lon"]      = next((orig for lo, orig in cols.items() if "lon" in lo or "lng" in lo), None)
+    col_map["categoria"]= next((orig for lo, orig in cols.items() if "categoria" in lo), None)
+    col_map["data"]     = next((orig for lo, orig in cols.items() if "data" in lo or "date" in lo), None)
+    col_map["mortos"]   = next((orig for lo, orig in cols.items() if "morto" in lo or "dead" in lo or "obito" in lo), None)
+    col_map["feridos"]  = next((orig for lo, orig in cols.items() if "ferido" in lo or "injur" in lo or "wound" in lo), None)
 
     total = con.execute("SELECT COUNT(*) FROM acidentes").fetchone()[0]
     return con, col_map, total
@@ -256,10 +252,10 @@ def query_accidents(route_coords: list, buffer_km: float) -> pd.DataFrame:
 
     lat_col  = col_map["lat"]
     lon_col  = col_map["lon"]
-    tipo_col = col_map["tipo"]
+    cat_col  = col_map["categoria"]
 
     selects = [f'"{lat_col}" AS latitude', f'"{lon_col}" AS longitude']
-    selects.append(f'"{tipo_col}" AS tipo_acidente' if tipo_col else "'Outros' AS tipo_acidente")
+    selects.append(f'"{cat_col}" AS categoria_acidente' if cat_col else "'Sem categoria' AS categoria_acidente")
     for alias, key in [("data_acidente", "data"), ("mortos", "mortos"), ("feridos", "feridos")]:
         if col_map.get(key):
             selects.append(f'"{col_map[key]}" AS {alias}')
@@ -354,11 +350,11 @@ def build_map(route_coords: list, accidents_df: pd.DataFrame) -> folium.Map:
     if accidents_df.empty:
         return m
 
-    tipos = sorted(accidents_df["tipo_acidente"].dropna().unique())
+    categorias = sorted(accidents_df["categoria_acidente"].dropna().unique())
 
-    for tipo in tipos:
+    for tipo in categorias:
         tipo_str  = str(tipo)
-        hex_color = ACCIDENT_COLORS.get(tipo_str, "#7f8c8d")
+        hex_color = ACCIDENT_COLORS.get(tipo_str, _COLOR_DEFAULT)
 
         # FeatureGroup → aparece como camada ligável/desligável na legenda
         fg = folium.FeatureGroup(name=f"● {tipo_str}", show=True)
@@ -374,11 +370,12 @@ def build_map(route_coords: list, accidents_df: pd.DataFrame) -> folium.Map:
             },
         )
 
-        subset = accidents_df[accidents_df["tipo_acidente"].astype(str) == tipo_str]
+        subset = accidents_df[accidents_df["categoria_acidente"].astype(str) == tipo_str]
 
         for _, row in subset.iterrows():
+            cat_label = str(row.get("categoria_acidente", "Sem categoria"))
             popup_html = (
-                f"<b style='color:{hex_color}'>{tipo_str}</b><br>"
+                f"<b style='color:{hex_color}'>{cat_label}</b><br>"
                 f"<small>Lat {row['latitude']:.5f} | Lon {row['longitude']:.5f}</small>"
             )
             if "dist_rota_m" in row:
@@ -409,7 +406,7 @@ def build_map(route_coords: list, accidents_df: pd.DataFrame) -> folium.Map:
                 location=[row["latitude"], row["longitude"]],
                 icon=div_icon,
                 popup=folium.Popup(popup_html, max_width=230),
-                tooltip=tipo_str,
+                tooltip=cat_label,
             ).add_to(cluster)
 
         cluster.add_to(fg)
@@ -436,18 +433,19 @@ with st.sidebar:
     st.header("🗂️ Base de dados")
     if _data_ok:
         st.success(f"✅ Parquet carregado\n\n**{_total_records:,}** registros disponíveis")
-        tipos_disponiveis = (
-            _con.execute("SELECT DISTINCT tipo_acidente FROM acidentes ORDER BY 1")
-            .df()["tipo_acidente"]
+        cat_col_name = _col_map.get("categoria")
+        categorias_disponiveis = (
+            _con.execute(f'SELECT DISTINCT "{cat_col_name}" FROM acidentes ORDER BY 1')
+            .df()[cat_col_name]
             .dropna()
             .tolist()
-            if _col_map.get("tipo") else []
+            if cat_col_name else list(ACCIDENT_COLORS.keys())
         )
-        if tipos_disponiveis:
-            st.caption("Tipos de acidente presentes:")
-            for t in tipos_disponiveis:
-                hex_cor = ACCIDENT_COLORS.get(str(t), "#7f8c8d")
-                st.markdown(f"<span style='color:{hex_cor}'>●</span> {t}", unsafe_allow_html=True)
+        if categorias_disponiveis:
+            st.caption("Categorias de acidente:")
+            for cat in categorias_disponiveis:
+                hex_cor = ACCIDENT_COLORS.get(str(cat), _COLOR_DEFAULT)
+                st.markdown(f"<span style='color:{hex_cor}'>●</span> {cat}", unsafe_allow_html=True)
     else:
         st.error(f"Erro ao carregar dados:\n{_load_error}")
 
@@ -462,7 +460,7 @@ with st.sidebar:
         "**Como usar**\n"
         "1. Digite origem e destino\n"
         "2. Clique em **Calcular Rota**\n"
-        "3. Explore o mapa — use a legenda para filtrar tipos de acidente"
+        "3. Explore o mapa — use a legenda para filtrar categorias de acidente"
     )
 
     if st.session_state.has_result:
@@ -536,9 +534,9 @@ if st.session_state.has_result:
     m1, m2, m3 = st.columns(3)
     m1.metric("📍 Pontos calculados na rota", f"{len(route_coords):,}")
     m2.metric("⚠️ Acidentes no buffer", f"{total_acc:,}")
-    if total_acc > 0 and "tipo_acidente" in accidents_df.columns:
-        top = accidents_df["tipo_acidente"].value_counts().idxmax()
-        m3.metric("🔝 Tipo mais frequente", top)
+    if total_acc > 0 and "categoria_acidente" in accidents_df.columns:
+        top = accidents_df["categoria_acidente"].value_counts().idxmax()
+        m3.metric("🔝 Categoria mais frequente", top)
 
     # Mapa
     st.markdown("### 🗺️ Mapa")
@@ -547,13 +545,14 @@ if st.session_state.has_result:
 
     # Tabela e gráfico
     if total_acc > 0:
-        with st.expander(f"📋 Tabela de acidentes ({total_acc} registros)", expanded=False):
-            st.dataframe(accidents_df, use_container_width=True)
 
-        st.markdown("### 📊 Distribuição por Tipo")
-        tc = accidents_df["tipo_acidente"].value_counts().reset_index()
-        tc.columns = ["Tipo", "Quantidade"]
-        st.bar_chart(tc.set_index("Tipo"))
+        st.markdown("### 📊 Distribuição por Categoria")
+        tc = accidents_df["categoria_acidente"].value_counts().reset_index()
+        tc.columns = ["Categoria", "Quantidade"]
+        # Aplica cor de cada categoria no gráfico
+        st.bar_chart(
+            tc.set_index("Categoria")
+        )
     else:
         st.success("✅ Nenhum acidente registrado encontrado neste trecho.")
 
